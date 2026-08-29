@@ -1,0 +1,31 @@
+min_version = "2024.11.1"
+
+[tools]
+rust = "stable"
+
+[vars]
+dist_dir = "dist"
+linux_glibc = "2.17"
+
+[env]
+# Isolated cargo home / target so release binaries do not embed $HOME paths.
+CARGO_HOME_DIR = "/tmp/zsync-cargo"
+CARGO_TARGET_DIR = "/tmp/zsync-target"
+DIST_DIR = "{{vars.dist_dir}}"
+ZSYNC_LINUX_GLIBC = "{{vars.linux_glibc}}"
+
+[tasks.format]
+description = "Format the whole project (nightly rustfmt: rustfmt.toml unstable options)"
+alias = ["fmt"]
+tools = { rust = "nightly" }
+run = "cargo fmt --all"
+
+[tasks.release]
+description = "Release-zip macOS / Linux / Windows: native cargo on the host OS, cargo-zigbuild elsewhere"
+alias = ["dist"]
+tools = { zig = "0.14.0", "cargo:cargo-zigbuild" = "0.20.1" }
+run = "bash scripts/release.sh"
+
+[tasks."release:clean"]
+description = "Remove release zip artifacts and the isolated cargo target cache"
+run = "rm -rf {{vars.dist_dir}} /tmp/zsync-target"

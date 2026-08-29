@@ -1,0 +1,308 @@
+#[cfg(not(target_os = "windows"))]
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
+use std::{path::Path, sync::Arc};
+
+use anyhow::Result;
+#[cfg(not(target_os = "windows"))]
+use anyhow::{bail, Context};
+
+use super::{Backend, FileBackend, Item};
+
+struct Native {
+    name: &'static str,
+    file: FileBackend,
+    getter: fn() -> Result<Option<(Vec<u8>, String)>>,
+    setter: fn(&[u8], &str) -> Result<()>,
+}
+
+impl Backend for Native {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn headless(&self) -> bool {
+        false
+    }
+    fn current_path(&self) -> std::path::PathBuf {
+        self.file.current_path()
+    }
+    fn get(&self) -> Result<Option<Item>> {
+        let Some((data, mime)) = (self.getter)()? else {
+            return Ok(None);
+        };
+        if data.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Item::new(mime, data)))
+    }
+    fn set(&self, item: &Item) -> Result<Item> {
+        let stored = self.file.set(item)?;
+        (self.setter)(&stored.data, &stored.mime)?;
+        Ok(stored)
+    }
+}
+
+pub fn open(dir: &Path) -> Result<Option<Arc<dyn Backend>>> {
+    #[cfg(target_os = "macos")]
+    {
+        if look("pbcopy").is_some() && look("pbpaste").is_some() {
+            return Ok(Some(Arc::new(Native {
+                name: "pboard",
+                file: FileBackend::open(dir)?,
+                getter: darwin_get,
+                setter: darwin_set,
+            })));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && look("wl-copy").is_some()
+            && look("wl-paste").is_some()
+        {
+            return Ok(Some(Arc::new(Native {
+                name: "wayland",
+                file: FileBackend::open(dir)?,
+                getter: wayland_get,
+                setter: wayland_set,
+            })));
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            if look("xclip").is_some() {
+                return Ok(Some(Arc::new(Native {
+                    name: "xclip",
+                    file: FileBackend::open(dir)?,
+                    getter: xclip_get,
+                    setter: xclip_set,
+                })));
+            }
+            if look("xsel").is_some() {
+                return Ok(Some(Arc::new(Native {
+                    name: "xsel",
+                    file: FileBackend::open(dir)?,
+                    getter: xsel_get,
+                    setter: xsel_set,
+                })));
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Some(Arc::new(Native {
+            name: "win32",
+            file: FileBackend::open(dir)?,
+            getter: windows_get,
+            setter: windows_set,
+        })));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        Ok(None)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn look(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_out(bin: &str, args: &[&str]) -> Result<Vec<u8>> {
+    let out = Command::new(bin).args(args).output()?;
+    if !out.status.success() {
+        bail!("{bin} exited {}", out.status);
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_in(bin: &str, args: &[&str], data: &[u8]) -> Result<()> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {bin}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(data)?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("{bin} failed: {err}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_get() -> Result<Option<(Vec<u8>, String)>> {
+    if let Ok(text) = run_out("pbpaste", &[]) {
+        if !text.is_empty() {
+            return Ok(Some((text, "text/plain".into())));
+        }
+    }
+    if let Ok(Some(png)) = darwin_png() {
+        if !png.is_empty() {
+            return Ok(Some((png, "image/png".into())));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_set(data: &[u8], mime: &str) -> Result<()> {
+    if mime.starts_with("image/") {
+        let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
+        let path = std::env::temp_dir().join(format!("zsync-clip.{ext}"));
+        std::fs::write(&path, data)?;
+        let posix = path.display().to_string();
+        let script = if mime == "image/png" || ext == "png" {
+            format!(
+                r#"set the clipboard to (read (POSIX file "{posix}") as «class PNGf»)"#
+            )
+        } else {
+            format!(
+                r#"set the clipboard to (read (POSIX file "{posix}") as JPEG picture)"#
+            )
+        };
+        let status =
+            Command::new("osascript").args(["-e", &script]).status()?;
+        let _ = std::fs::remove_file(&path);
+        if !status.success() {
+            bail!("osascript failed to set image clipboard");
+        }
+        return Ok(());
+    }
+    run_in("pbcopy", &[], data)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_png() -> Result<Option<Vec<u8>>> {
+    let dir =
+        std::env::temp_dir().join(format!("zsync-png-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("clip.png");
+    let posix = path.display().to_string();
+    let script = format!(
+        r#"
+try
+    set png_data to (the clipboard as «class PNGf»)
+    set out to open for access POSIX file "{posix}" with write permission
+    write png_data to out
+    close access out
+on error
+    return
+end try
+"#
+    );
+    let _ = Command::new("osascript").args(["-e", &script]).status();
+    let data = std::fs::read(&path).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(data)
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_get() -> Result<Option<(Vec<u8>, String)>> {
+    if let Ok(types) = run_out("wl-paste", &["--list-types"]) {
+        let list = String::from_utf8_lossy(&types);
+        if list.contains("image/png") && !list.contains("text/plain") {
+            if let Ok(b) =
+                run_out("wl-paste", &["--no-newline", "-t", "image/png"])
+            {
+                if !b.is_empty() {
+                    return Ok(Some((b, "image/png".into())));
+                }
+            }
+        }
+    }
+    match run_out("wl-paste", &["--no-newline"]) {
+        Ok(b) if !b.is_empty() => Ok(Some((b, "text/plain".into()))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_set(data: &[u8], mime: &str) -> Result<()> {
+    if mime.starts_with("image/") {
+        return run_in("wl-copy", &["-t", mime], data);
+    }
+    run_in("wl-copy", &[], data)
+}
+
+#[cfg(target_os = "linux")]
+fn xclip_get() -> Result<Option<(Vec<u8>, String)>> {
+    if let Ok(targets) =
+        run_out("xclip", &["-selection", "clipboard", "-o", "-t", "TARGETS"])
+    {
+        let t = String::from_utf8_lossy(&targets);
+        if t.contains("image/png")
+            && !t.contains("UTF8_STRING")
+            && !t.contains("text/plain")
+        {
+            if let Ok(b) = run_out(
+                "xclip",
+                &["-selection", "clipboard", "-o", "-t", "image/png"],
+            ) {
+                if !b.is_empty() {
+                    return Ok(Some((b, "image/png".into())));
+                }
+            }
+        }
+    }
+    match run_out("xclip", &["-selection", "clipboard", "-o"]) {
+        Ok(b) if !b.is_empty() => Ok(Some((b, "text/plain".into()))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn xclip_set(data: &[u8], mime: &str) -> Result<()> {
+    if mime.starts_with("image/") {
+        return run_in("xclip", &["-selection", "clipboard", "-t", mime], data);
+    }
+    run_in("xclip", &["-selection", "clipboard"], data)
+}
+
+#[cfg(target_os = "linux")]
+fn xsel_get() -> Result<Option<(Vec<u8>, String)>> {
+    match run_out("xsel", &["--clipboard", "--output"]) {
+        Ok(b) if !b.is_empty() => Ok(Some((b, "text/plain".into()))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn xsel_set(data: &[u8], _mime: &str) -> Result<()> {
+    run_in("xsel", &["--clipboard", "--input"], data)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_get() -> Result<Option<(Vec<u8>, String)>> {
+    match clipboard_win::get_clipboard_string() {
+        Ok(s) if !s.is_empty() => {
+            Ok(Some((s.into_bytes(), "text/plain".into())))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_set(data: &[u8], mime: &str) -> Result<()> {
+    if mime.starts_with("image/") {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(data);
+    clipboard_win::set_clipboard_string(&text)
+        .map_err(|e| anyhow::anyhow!("set clipboard: {e}"))
+}
