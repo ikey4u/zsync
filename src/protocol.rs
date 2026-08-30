@@ -23,6 +23,8 @@ pub enum ProtoError {
     BadMeta,
     #[error("clip size mismatch ({got} != {want})")]
     SizeMismatch { got: usize, want: usize },
+    #[error("clip hash mismatch")]
+    HashMismatch,
     #[error("unknown frame type {0}")]
     UnknownType(u8),
     #[error(transparent)]
@@ -77,6 +79,9 @@ pub struct ClipMeta {
     pub mime: String,
     pub hash: String,
     pub size: usize,
+    /// Original filename when the clip is a copied file (basename only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +137,9 @@ pub fn detect_mime(data: &[u8]) -> String {
     if data.len() >= 4 && data.starts_with(b"GIF8") {
         return "image/gif".into();
     }
+    if data.starts_with(b"%PDF") {
+        return "application/pdf".into();
+    }
     if data.is_empty()
         || (std::str::from_utf8(data).is_ok() && !data.contains(&0))
     {
@@ -140,13 +148,51 @@ pub fn detect_mime(data: &[u8]) -> String {
     "application/octet-stream".into()
 }
 
+pub fn mime_from_filename(name: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(name)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "json" => "application/json",
+        "txt" | "md" | "rs" | "toml" | "py" | "sh" | "c" | "h" | "go"
+        | "ts" | "js" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => return None,
+    })
+}
+
 pub fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
-        "image/png" => ".png",
-        "image/jpeg" => ".jpg",
-        "image/gif" => ".gif",
-        "text/plain" => ".txt",
-        _ => ".bin",
+    if mime.starts_with("image/png") {
+        ".png"
+    } else if mime.starts_with("image/jpeg") || mime.starts_with("image/jpg") {
+        ".jpg"
+    } else if mime.starts_with("image/gif") {
+        ".gif"
+    } else if mime.starts_with("image/webp") {
+        ".webp"
+    } else if mime.starts_with("application/pdf") {
+        ".pdf"
+    } else if mime.starts_with("application/zip") {
+        ".zip"
+    } else if mime.starts_with("text/plain") {
+        ".txt"
+    } else if mime.starts_with("text/html") {
+        ".html"
+    } else {
+        ".bin"
     }
 }
 
@@ -170,7 +216,8 @@ pub fn encode_json<T: Serialize>(
     encode_frame(typ, &serde_json::to_vec(v)?)
 }
 
-pub fn encode_clip(clip: &Clip) -> Result<Vec<u8>, ProtoError> {
+/// Clip body only (meta + bytes), used as AEAD plaintext on the relay path.
+pub fn encode_clip_body(clip: &Clip) -> Result<Vec<u8>, ProtoError> {
     if clip.data.len() > MAX_CLIP {
         return Err(ProtoError::TooLarge);
     }
@@ -185,7 +232,11 @@ pub fn encode_clip(clip: &Clip) -> Result<Vec<u8>, ProtoError> {
     payload.extend_from_slice(&(meta_bytes.len() as u16).to_be_bytes());
     payload.extend_from_slice(&meta_bytes);
     payload.extend_from_slice(&clip.data);
-    encode_frame(Type::Clip, &payload)
+    Ok(payload)
+}
+
+pub fn encode_clip(clip: &Clip) -> Result<Vec<u8>, ProtoError> {
+    encode_frame(Type::Clip, &encode_clip_body(clip)?)
 }
 
 pub fn decode_frame(buf: &[u8]) -> Result<(Type, Vec<u8>), ProtoError> {
@@ -227,7 +278,7 @@ pub fn decode_clip(payload: &[u8]) -> Result<Clip, ProtoError> {
     }
     let meta: ClipMeta = serde_json::from_slice(&payload[2..2 + meta_len])?;
     let data = payload[2 + meta_len..].to_vec();
-    if meta.size != 0 && meta.size != data.len() {
+    if meta.size != data.len() {
         return Err(ProtoError::SizeMismatch {
             got: data.len(),
             want: meta.size,
@@ -237,6 +288,23 @@ pub fn decode_clip(payload: &[u8]) -> Result<Clip, ProtoError> {
         return Err(ProtoError::TooLarge);
     }
     Ok(Clip { meta, data })
+}
+
+/// Full payload, matching size and SHA-256. Call before writing the clipboard.
+pub fn verify_clip(clip: &Clip) -> Result<(), ProtoError> {
+    if clip.data.len() > MAX_CLIP || clip.meta.size > MAX_CLIP {
+        return Err(ProtoError::TooLarge);
+    }
+    if clip.meta.size != clip.data.len() {
+        return Err(ProtoError::SizeMismatch {
+            got: clip.data.len(),
+            want: clip.meta.size,
+        });
+    }
+    if clip.meta.hash.is_empty() || hash(&clip.data) != clip.meta.hash {
+        return Err(ProtoError::HashMismatch);
+    }
+    Ok(())
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(
@@ -332,6 +400,7 @@ mod tests {
                 mime: "text/plain".into(),
                 hash: hash(&data),
                 size: data.len(),
+                name: String::new(),
             },
             data,
         };
@@ -345,6 +414,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_or_corrupt_clip() {
+        let data = b"hello clipboard".to_vec();
+        let clip = Clip {
+            meta: ClipMeta {
+                origin_id: "n1".into(),
+                seq: 1,
+                mime: "text/plain".into(),
+                hash: hash(&data),
+                size: data.len(),
+                name: String::new(),
+            },
+            data: data.clone(),
+        };
+        let mut payload = encode_clip_body(&clip).unwrap();
+        payload.pop();
+        assert!(matches!(
+            decode_clip(&payload),
+            Err(ProtoError::SizeMismatch { .. })
+        ));
+        let mut bad = clip.clone();
+        bad.data[0] ^= 0xff;
+        assert!(matches!(verify_clip(&bad), Err(ProtoError::HashMismatch)));
+        let mut short = clip;
+        short.data.pop();
+        assert!(verify_clip(&short).is_err());
+    }
+
+    #[test]
     fn rejects_too_large() {
         let data = vec![0u8; MAX_CLIP + 1];
         let clip = Clip {
@@ -354,6 +451,7 @@ mod tests {
                 mime: "application/octet-stream".into(),
                 hash: hash(&data),
                 size: data.len(),
+                name: String::new(),
             },
             data,
         };

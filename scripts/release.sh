@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Cross-compile zsync release zips for macOS / Linux / Windows.
+# zsyncd is packaged separately: Linux x64 glibc 2.17 only.
 #
 # Linker choice:
 #   target OS == host OS  → cargo (native SDK / libc)
@@ -138,7 +139,8 @@ use_native() {
 
 bin_path() {
   local triple="$1"
-  local bin="${CARGO_TARGET_DIR}/${triple}/release/${NAME}"
+  local name="${2:-zsync}"
+  local bin="${CARGO_TARGET_DIR}/${triple}/release/${name}"
   if [[ "${triple}" == *"-windows-"* ]]; then
     bin="${bin}.exe"
   fi
@@ -149,11 +151,12 @@ package_zip() {
   local os_name="$1"
   local arch_name="$2"
   local src_bin="$3"
-  local zip_name="${NAME}-${os_name}-${arch_name}-${VERSION}.zip"
-  local stage="${DIST_DIR}/.stage-${os_name}-${arch_name}"
-  local bin_name="${NAME}"
+  local pkg_name="${4:-${NAME}}"
+  local zip_name="${pkg_name}-${os_name}-${arch_name}-${VERSION}.zip"
+  local stage="${DIST_DIR}/.stage-${pkg_name}-${os_name}-${arch_name}"
+  local bin_name="${pkg_name}"
   if [[ "${os_name}" == "windows" ]]; then
-    bin_name="${NAME}.exe"
+    bin_name="${pkg_name}.exe"
   fi
 
   rm -rf "${stage}"
@@ -248,19 +251,47 @@ verify_no_personal_paths() {
   echo "    OK: $bin"
 }
 
+package_built_bin() {
+  local triple="$1"
+  local os_name="$2"
+  local arch_name="$3"
+  local name="$4"
+  local bin
+  bin="$(bin_path "${triple}" "${name}")"
+  if [[ ! -f "${bin}" ]]; then
+    echo "error: missing binary ${bin}" >&2
+    return 1
+  fi
+  strip_bin "${triple}" "${bin}"
+  if [[ "${SKIP_VERIFY:-0}" != "1" ]]; then
+    verify_no_personal_paths "${bin}" "${os_name}-${arch_name}-${name}"
+  fi
+  if [[ "${SKIP_PACKAGE:-0}" != "1" ]]; then
+    package_zip "${os_name}" "${arch_name}" "${bin}" "${name}"
+  fi
+}
+
 # Prints the binary path on success.
+# Linux x64 also builds zsyncd (glibc 2.17) into a separate zip.
 build_one() {
   local triple="$1"
   local os_name="$2"
   local arch_name="$3"
-  local bin extra=""
+  local extra="" linux_x64=""
+  local -a bins=(--bin zsync)
+
+  if [[ "${os_name}" == "linux" && "${arch_name}" == "x64" ]]; then
+    linux_x64=1
+    bins+=(--bin zsyncd)
+  fi
 
   ensure_target "${triple}" || return 1
 
-  if use_native "${triple}"; then
-    echo "==> native cargo --release --target ${triple}"
+  # Linux x64 always zigbuilds so zsyncd (and zsync) link glibc 2.17.
+  if [[ -z "${linux_x64}" ]] && use_native "${triple}"; then
+    echo "==> native cargo --release --target ${triple} ${bins[*]}"
     export_build_env
-    cargo build --release --target "${triple}" || return 1
+    cargo build --release --target "${triple}" "${bins[@]}" || return 1
   else
     local zig_target="${triple}"
     if [[ "${os_name}" == "linux" ]]; then
@@ -277,22 +308,40 @@ build_one() {
       export "CC_x86_64_pc_windows_gnu=${MINGW_CC:-x86_64-w64-mingw32-gcc}"
       export "AR_x86_64_pc_windows_gnu=${MINGW_AR:-x86_64-w64-mingw32-ar}"
     fi
-    echo "==> cargo zigbuild --release --target ${zig_target}"
+    echo "==> cargo zigbuild --release --target ${zig_target} ${bins[*]}"
     export_build_env "${extra}"
-    cargo zigbuild --release --target "${zig_target}" || return 1
+    cargo zigbuild --release --target "${zig_target}" "${bins[@]}" || return 1
   fi
 
-  bin="$(bin_path "${triple}")"
+  package_built_bin "${triple}" "${os_name}" "${arch_name}" zsync || return 1
+  if [[ -n "${linux_x64}" ]]; then
+    package_built_bin "${triple}" "${os_name}" "${arch_name}" zsyncd || return 1
+  fi
+}
+
+# zsyncd is a server binary: Linux x64 glibc 2.17 only.
+build_zsyncd_linux_x64() {
+  local triple="x86_64-unknown-linux-gnu"
+  local zig_target="${triple}.${GLIBC}"
+  local bin
+
+  ensure_target "${triple}" || return 1
+
+  echo "==> cargo zigbuild --release --target ${zig_target} --bin zsyncd"
+  export_build_env
+  cargo zigbuild --release --target "${zig_target}" --bin zsyncd || return 1
+
+  bin="$(bin_path "${triple}" zsyncd)"
   if [[ ! -f "${bin}" ]]; then
     echo "error: missing binary ${bin}" >&2
     return 1
   fi
   strip_bin "${triple}" "${bin}"
   if [[ "${SKIP_VERIFY:-0}" != "1" ]]; then
-    verify_no_personal_paths "${bin}" "${os_name}-${arch_name}"
+    verify_no_personal_paths "${bin}" "linux-x64-zsyncd"
   fi
   if [[ "${SKIP_PACKAGE:-0}" != "1" ]]; then
-    package_zip "${os_name}" "${arch_name}" "${bin}"
+    package_zip "linux" "x64" "${bin}" "zsyncd"
   fi
 }
 
@@ -303,15 +352,70 @@ try_build() {
   fi
 }
 
+usage() {
+  echo "usage: $0 [macos:arm64|linux:x64|zsyncd]" >&2
+  echo "  no args  build all zsync zips + zsyncd linux x64" >&2
+  echo "  macos:arm64 | linux:x64  build that zsync zip (linux:x64 also builds zsyncd)" >&2
+  echo "  zsyncd  build zsyncd linux x64 (glibc ${GLIBC}) only" >&2
+  exit 1
+}
+
+build_all() {
+  # zsyncd ships only as linux-x64 / glibc 2.17; fail the release if it cannot build.
+  build_one "x86_64-unknown-linux-gnu" "linux" "x64" || return 1
+  try_build "aarch64-unknown-linux-gnu" "linux" "arm64"
+
+  if [[ "${HOST_KIND}" == "windows" ]]; then
+    build_one "${HOST_TRIPLE}" "windows" "${HOST_ARCH_NAME}"
+  else
+    build_one "x86_64-pc-windows-gnu" "windows" "x64"
+  fi
+
+  if [[ "${HOST_KIND}" == "macos" ]]; then
+    try_build "x86_64-apple-darwin" "macos" "x64"
+    try_build "aarch64-apple-darwin" "macos" "arm64"
+    if command -v lipo >/dev/null 2>&1 \
+      && [[ -f "$(bin_path x86_64-apple-darwin)" ]] \
+      && [[ -f "$(bin_path aarch64-apple-darwin)" ]]; then
+      echo "==> lipo macos-universal"
+      univ_bin="${DIST_DIR}/.zsync-universal"
+      lipo -create \
+        -output "${univ_bin}" \
+        "$(bin_path x86_64-apple-darwin)" \
+        "$(bin_path aarch64-apple-darwin)"
+      strip_bin "aarch64-apple-darwin" "${univ_bin}"
+      if [[ "${SKIP_PACKAGE:-0}" != "1" ]]; then
+        package_zip "macos" "universal" "${univ_bin}"
+      fi
+      rm -f "${univ_bin}"
+    fi
+  else
+    echo "note: host is not macOS; Apple targets need a macOS SDK (SDKROOT)"
+    try_build "x86_64-apple-darwin" "macos" "x64"
+    try_build "aarch64-apple-darwin" "macos" "arm64"
+  fi
+}
+
+ONLY="${1:-}"
+if [[ "${ONLY}" != "" && "${ONLY}" != "macos:arm64" && "${ONLY}" != "linux:x64" && "${ONLY}" != "zsyncd" ]]; then
+  usage
+fi
+
 echo "${NAME} ${VERSION} → ${DIST_DIR}/ (host ${HOST_KIND}/${HOST_ARCH_NAME} ${HOST_TRIPLE}, linux glibc ${GLIBC})"
-echo "native cargo on ${HOST_KIND}; zigbuild for other OSes"
-echo "zip: ${NAME}-{os}-{arch}-{version}.zip"
+if [[ -n "${ONLY}" ]]; then
+  echo "target: ${ONLY}"
+else
+  echo "native cargo on ${HOST_KIND}; zigbuild for other OSes"
+fi
+echo "zip: zsync-{os}-{arch}-{version}.zip  and  zsyncd-linux-x64-{version}.zip"
 
 need_cmd cargo "rustup default stable"
 need_cmd rustup "https://rustup.rs/"
-need_cmd zig "mise release installs zig via task tools"
-need_cmd cargo-zigbuild "mise release installs cargo-zigbuild via task tools"
 need_cmd zip
+if [[ -z "${ONLY}" || "${ONLY}" == "linux:x64" || "${ONLY}" == "zsyncd" ]]; then
+  need_cmd zig "mise release / release:linux:x64 / release:zsyncd installs zig via task tools"
+  need_cmd cargo-zigbuild "mise release / release:linux:x64 / release:zsyncd installs cargo-zigbuild via task tools"
+fi
 
 echo "==> clean cargo target cache ${CARGO_TARGET_DIR}"
 rm -rf "${CARGO_TARGET_DIR}"
@@ -325,44 +429,18 @@ fi
 
 mkdir -p "${DIST_DIR}"
 
-# --- Linux ---
-try_build "x86_64-unknown-linux-gnu" "linux" "x64"
-try_build "aarch64-unknown-linux-gnu" "linux" "arm64"
-
-# --- Windows ---
-if [[ "${HOST_KIND}" == "windows" ]]; then
-  build_one "${HOST_TRIPLE}" "windows" "${HOST_ARCH_NAME}"
+if [[ "${ONLY}" == "macos:arm64" ]]; then
+  build_one "aarch64-apple-darwin" "macos" "arm64"
+elif [[ "${ONLY}" == "linux:x64" ]]; then
+  build_one "x86_64-unknown-linux-gnu" "linux" "x64"
+elif [[ "${ONLY}" == "zsyncd" ]]; then
+  build_zsyncd_linux_x64
 else
-  build_one "x86_64-pc-windows-gnu" "windows" "x64"
-fi
-
-# --- macOS ---
-if [[ "${HOST_KIND}" == "macos" ]]; then
-  try_build "x86_64-apple-darwin" "macos" "x64"
-  try_build "aarch64-apple-darwin" "macos" "arm64"
-  if command -v lipo >/dev/null 2>&1 \
-    && [[ -f "$(bin_path x86_64-apple-darwin)" ]] \
-    && [[ -f "$(bin_path aarch64-apple-darwin)" ]]; then
-    echo "==> lipo macos-universal"
-    univ_bin="${DIST_DIR}/.zsync-universal"
-    lipo -create \
-      -output "${univ_bin}" \
-      "$(bin_path x86_64-apple-darwin)" \
-      "$(bin_path aarch64-apple-darwin)"
-    strip_bin "aarch64-apple-darwin" "${univ_bin}"
-    if [[ "${SKIP_PACKAGE:-0}" != "1" ]]; then
-      package_zip "macos" "universal" "${univ_bin}"
-    fi
-    rm -f "${univ_bin}"
-  fi
-else
-  echo "note: host is not macOS; Apple targets need a macOS SDK (SDKROOT)"
-  try_build "x86_64-apple-darwin" "macos" "x64"
-  try_build "aarch64-apple-darwin" "macos" "arm64"
+  build_all
 fi
 
 rm -rf "${DIST_DIR}"/.stage-* 2>/dev/null || true
 
 echo
 echo "Done. Artifacts:"
-ls -la "${DIST_DIR}"/${NAME}-*-*.zip 2>/dev/null | sed 's/^/  /' || ls -la "${DIST_DIR}" | sed 's/^/  /'
+ls -la "${DIST_DIR}"/*.zip 2>/dev/null | sed 's/^/  /' || ls -la "${DIST_DIR}" | sed 's/^/  /'

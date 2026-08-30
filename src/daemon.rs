@@ -7,10 +7,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use iroh::endpoint::Connection as IrohConn;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::watch;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::watch,
+};
 
 use crate::{
     clipboard::{self, Item},
@@ -18,10 +20,12 @@ use crate::{
         self, kill_pid, pid_alive, read_pid, write_pid, Config, Paths,
         StateFile,
     },
+    group,
     hub::Hub,
     ipc::{self, PeerStatus, Request, Response, StatusPayload},
-    net::{self, ALPN},
+    net,
     protocol::{self, Type},
+    relay, tlsutil,
 };
 
 struct Runtime {
@@ -29,8 +33,8 @@ struct Runtime {
     state: Arc<StateFile>,
     peers: Mutex<HashMap<String, PeerEntry>>,
     live: Mutex<HashSet<String>>,
-    endpoint: iroh::Endpoint,
-    ticket: Mutex<Option<String>>,
+    zsync_dir: std::path::PathBuf,
+    port: u16,
     shutdown: watch::Sender<bool>,
 }
 
@@ -127,8 +131,9 @@ async fn run_agent() -> Result<()> {
     cleanup_stale(&paths);
 
     let node_id = config::load_or_create_node_id(&paths)?;
-    let secret = net::load_or_create_secret(&paths.secret)?;
-    let endpoint = net::bind_endpoint(secret).await?;
+    let port = net::listen_port();
+    let listener = net::bind_listener(port).await?;
+    let port = listener.local_addr()?.port();
     let state = Arc::new(StateFile::open(&paths)?);
     let backend = clipboard::open(&paths.dir)?;
     let hub = Hub::new(node_id, backend, Arc::clone(&state), cfg.suppress_ttl);
@@ -139,8 +144,8 @@ async fn run_agent() -> Result<()> {
         state: Arc::clone(&state),
         peers: Mutex::new(HashMap::new()),
         live: Mutex::new(HashSet::new()),
-        endpoint,
-        ticket: Mutex::new(None),
+        zsync_dir: paths.dir.clone(),
+        port,
         shutdown,
     });
 
@@ -165,17 +170,27 @@ async fn run_agent() -> Result<()> {
 
     let accept_rt = Arc::clone(&rt);
     tokio::spawn(async move {
-        accept_loop(accept_rt).await;
-    });
-
-    let ticket_rt = Arc::clone(&rt);
-    tokio::spawn(async move {
-        refresh_ticket(&ticket_rt).await;
+        accept_loop(accept_rt, listener).await;
     });
 
     for peer in state.get().peers {
         if peer.enabled {
-            spawn_peer(&rt, &peer.uri, false);
+            let mut target = match net::parse_peer(&peer.uri) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(uri = %net::display_uri(&peer.uri), "bad peer: {e:#}");
+                    continue;
+                }
+            };
+            if let Err(e) = net::resolve_relay(&paths.dir, &mut target) {
+                tracing::warn!(uri = %target.uri, "relay key: {e:#}");
+                continue;
+            }
+            if target.uri != peer.uri {
+                let _ = state.remove_peer(Some(&peer.uri));
+                let _ = state.upsert_peer(&target.uri, true);
+            }
+            spawn_peer(&rt, &target.uri, false);
         }
     }
 
@@ -327,14 +342,18 @@ async fn watch_clipboard(
 }
 
 fn spawn_peer(rt: &Arc<Runtime>, uri: &str, force_dial: bool) {
-    let target = match net::parse_peer(uri) {
+    let mut target = match net::parse_peer(uri) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(%uri, "bad peer: {e:#}");
+            tracing::warn!(uri = %net::display_uri(uri), "bad peer: {e:#}");
             return;
         }
     };
-    let key = net::iroh_uri(target.endpoint_id);
+    if let Err(e) = net::resolve_relay(&rt.zsync_dir, &mut target) {
+        tracing::warn!(uri = %target.uri, "relay key: {e:#}");
+        return;
+    }
+    let key = target.uri.clone();
     let mut map = rt.peers.lock().unwrap();
     if let Some(existing) = map.get(&key) {
         if !*existing.stop.borrow() {
@@ -361,24 +380,20 @@ fn spawn_peer(rt: &Arc<Runtime>, uri: &str, force_dial: bool) {
     );
     drop(map);
     let rt = Arc::clone(rt);
+    let relay = target.relay.is_some();
     tokio::spawn(async move {
-        maintain_p2p(
-            rt,
-            target.addr,
-            target.endpoint_id,
-            status,
-            stop_rx,
-            force_dial,
-        )
-        .await;
+        if relay {
+            maintain_relay(rt, target, status, stop_rx).await;
+        } else {
+            maintain_tcp(rt, target, status, stop_rx).await;
+        }
     });
 }
 
 fn stop_peer(rt: &Arc<Runtime>, uri: &str) {
     let key = net::parse_peer(uri)
-        .ok()
-        .map(|t| net::iroh_uri(t.endpoint_id))
-        .unwrap_or_else(|| uri.to_string());
+        .map(|t| t.uri)
+        .unwrap_or_else(|_| net::display_uri(uri));
     if let Some(p) = rt.peers.lock().unwrap().remove(&key) {
         let _ = p.stop.send(true);
     }
@@ -393,16 +408,6 @@ fn short_err(e: &anyhow::Error) -> String {
     }
 }
 
-async fn refresh_ticket(rt: &Runtime) {
-    if net::wait_online(&rt.endpoint).await.is_ok() {
-        let t = net::ticket_for(&rt.endpoint);
-        *rt.ticket.lock().unwrap() = Some(t);
-    } else {
-        let t = net::ticket_for(&rt.endpoint);
-        *rt.ticket.lock().unwrap() = Some(t);
-    }
-}
-
 fn claim_live(rt: &Runtime, remote: &str) -> bool {
     rt.live.lock().unwrap().insert(remote.to_string())
 }
@@ -411,9 +416,7 @@ fn release_live(rt: &Runtime, remote: &str) {
     rt.live.lock().unwrap().remove(remote);
 }
 
-fn remember_incoming(rt: &Arc<Runtime>, remote_id: iroh::EndpointId) {
-    let uri = net::iroh_uri(remote_id);
-    let _ = rt.state.upsert_peer(&uri, true);
+fn remember_incoming(rt: &Arc<Runtime>, uri: String, hello: &protocol::Hello) {
     let mut map = rt.peers.lock().unwrap();
     map.entry(uri.clone()).or_insert_with(|| {
         let (stop_tx, _stop_rx) = watch::channel(false);
@@ -421,7 +424,8 @@ fn remember_incoming(rt: &Arc<Runtime>, remote_id: iroh::EndpointId) {
             status: Arc::new(Mutex::new(PeerStatus {
                 uri,
                 state: "connected".into(),
-                remote_node: Some(remote_id.to_string()),
+                remote_node: Some(hello.node_id.clone()),
+                remote_host: Some(hello.hostname.clone()),
                 ..PeerStatus::default()
             })),
             stop: stop_tx,
@@ -429,18 +433,21 @@ fn remember_incoming(rt: &Arc<Runtime>, remote_id: iroh::EndpointId) {
     });
 }
 
-async fn accept_loop(rt: Arc<Runtime>) {
-    let ep = rt.endpoint.clone();
+async fn accept_loop(rt: Arc<Runtime>, listener: TcpListener) {
+    tracing::info!("listening on 0.0.0.0:{}", rt.port);
     loop {
-        match ep.accept().await {
-            None => break,
-            Some(incoming) => {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
                 let rt = Arc::clone(&rt);
                 tokio::spawn(async move {
-                    if let Err(e) = run_incoming(rt, incoming).await {
-                        tracing::warn!("incoming p2p: {e:#}");
+                    if let Err(e) = run_incoming(rt, stream, peer).await {
+                        tracing::warn!("incoming: {e:#}");
                     }
                 });
+            }
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                break;
             }
         }
     }
@@ -448,79 +455,70 @@ async fn accept_loop(rt: Arc<Runtime>) {
 
 async fn run_incoming(
     rt: Arc<Runtime>,
-    incoming: iroh::endpoint::Incoming,
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
 ) -> Result<()> {
-    let conn = incoming.await.context("accept iroh connection")?;
-    let remote = conn.remote_id();
-    let remote_s = remote.to_string();
-    if !claim_live(&rt, &remote_s) {
-        conn.close(0u32.into(), b"already connected");
-        return Ok(());
-    }
-    remember_incoming(&rt, remote);
-    let (status, stop) = {
-        let map = rt.peers.lock().unwrap();
-        let e = map
-            .get(&net::iroh_uri(remote))
-            .expect("incoming peer just inserted");
-        (Arc::clone(&e.status), e.stop.subscribe())
-    };
-    let result = run_p2p_accept(&rt.hub, conn, Some(&status), stop).await;
-    release_live(&rt, &remote_s);
-    result
-}
-
-async fn run_p2p_accept(
-    hub: &Hub,
-    conn: IrohConn,
-    status: Option<&Mutex<PeerStatus>>,
-    mut stop: watch::Receiver<bool>,
-) -> Result<()> {
-    let (mut writer, mut reader) = conn.accept_bi().await?;
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
     let (typ, payload) = protocol::read_frame(&mut reader).await?;
     if typ != Type::Hello {
-        bail!("p2p accept expected Hello, got {typ:?}");
+        bail!("expected Hello, got {typ:?}");
     }
     let remote: protocol::Hello = serde_json::from_slice(&payload)?;
-    protocol::write_json(&mut writer, Type::HelloAck, &hub.hello()).await?;
-    if let Some(st) = status {
-        let mut s = st.lock().unwrap();
+    let live_key = remote.node_id.clone();
+    if !claim_live(&rt, &live_key) {
+        return Ok(());
+    }
+    remember_incoming(&rt, peer.to_string(), &remote);
+    let status = {
+        let map = rt.peers.lock().unwrap();
+        Arc::clone(
+            &map.get(&peer.to_string())
+                .expect("incoming peer just inserted")
+                .status,
+        )
+    };
+    let mut stop = {
+        let map = rt.peers.lock().unwrap();
+        map.get(&peer.to_string())
+            .expect("incoming peer just inserted")
+            .stop
+            .subscribe()
+    };
+    protocol::write_json(&mut writer, Type::HelloAck, &rt.hub.hello()).await?;
+    {
+        let mut s = status.lock().unwrap();
         s.state = "connected".into();
         s.remote_node = Some(remote.node_id.clone());
         s.remote_host = Some(remote.hostname.clone());
         s.last_error = None;
     }
-    framed_loop(
-        hub,
+    let result = framed_loop(
+        &rt.hub,
         &mut reader,
         &mut writer,
         &mut stop,
-        status,
+        Some(&status),
         Some(remote.node_id),
     )
-    .await
+    .await;
+    release_live(&rt, &live_key);
+    result
 }
 
-async fn maintain_p2p(
+async fn maintain_tcp(
     rt: Arc<Runtime>,
-    addr: iroh::EndpointAddr,
-    endpoint_id: iroh::EndpointId,
+    target: net::PeerTarget,
     status: Arc<Mutex<PeerStatus>>,
     mut stop: watch::Receiver<bool>,
-    force_dial: bool,
 ) {
-    let remote_s = endpoint_id.to_string();
-    if !net::should_dial(rt.hub.node_id(), endpoint_id, force_dial) {
-        status.lock().unwrap().state = "waiting".into();
-        let _ = stop.changed().await;
-        return;
-    }
+    let live_key = target.uri.clone();
     let mut delay = Duration::from_secs(1);
     loop {
         if *stop.borrow() {
             break;
         }
-        if rt.live.lock().unwrap().contains(&remote_s) {
+        if rt.live.lock().unwrap().contains(&live_key) {
             status.lock().unwrap().state = "connected".into();
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -533,10 +531,10 @@ async fn maintain_p2p(
             continue;
         }
         status.lock().unwrap().state = "connecting".into();
-        match run_p2p_dial(&rt, &addr, &remote_s, &status, &mut stop).await {
+        match run_tcp_dial(&rt, &target, &live_key, &status, &mut stop).await {
             Ok(()) => delay = Duration::from_secs(1),
             Err(e) => {
-                tracing::warn!(peer = %remote_s, error = %e, "p2p session ended");
+                tracing::warn!(peer = %live_key, error = %e, "session ended");
                 status.lock().unwrap().last_error = Some(short_err(&e));
             }
         }
@@ -557,34 +555,29 @@ async fn maintain_p2p(
     status.lock().unwrap().state = "disconnected".into();
 }
 
-async fn run_p2p_dial(
+async fn run_tcp_dial(
     rt: &Runtime,
-    addr: &iroh::EndpointAddr,
-    remote_s: &str,
+    target: &net::PeerTarget,
+    live_key: &str,
     status: &Mutex<PeerStatus>,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let conn = rt
-        .endpoint
-        .connect(addr.clone(), ALPN)
-        .await
-        .context("iroh connect")?;
-    if !claim_live(rt, remote_s) {
-        conn.close(0u32.into(), b"already connected");
+    let stream = net::connect_peer(target).await?;
+    if !claim_live(rt, live_key) {
         return Ok(());
     }
-    let result = run_p2p_init(&rt.hub, conn, status, stop).await;
-    release_live(rt, remote_s);
+    let result = run_tcp_init(&rt.hub, stream, status, stop).await;
+    release_live(rt, live_key);
     result
 }
 
-async fn run_p2p_init(
+async fn run_tcp_init(
     hub: &Hub,
-    conn: IrohConn,
+    stream: TcpStream,
     status: &Mutex<PeerStatus>,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let (mut writer, mut reader) = conn.open_bi().await?;
+    let (mut reader, mut writer) = stream.into_split();
     protocol::write_json(&mut writer, Type::Hello, &hub.hello()).await?;
     let (typ, payload) = protocol::read_frame(&mut reader).await?;
     if typ != Type::HelloAck && typ != Type::Hello {
@@ -610,6 +603,183 @@ async fn run_p2p_init(
         Some(remote.node_id),
     )
     .await
+}
+
+async fn maintain_relay(
+    rt: Arc<Runtime>,
+    target: net::PeerTarget,
+    status: Arc<Mutex<PeerStatus>>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let live_key = target.uri.clone();
+    let mut delay = Duration::from_secs(1);
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        status.lock().unwrap().state = "connecting".into();
+        match run_relay_dial(&rt, &target, &live_key, &status, &mut stop).await
+        {
+            Ok(()) => delay = Duration::from_secs(1),
+            Err(e) => {
+                tracing::warn!(peer = %live_key, error = %e, "relay session ended");
+                status.lock().unwrap().last_error = Some(short_err(&e));
+            }
+        }
+        if *stop.borrow() {
+            break;
+        }
+        status.lock().unwrap().state = "reconnecting".into();
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    break;
+                }
+            }
+        }
+        delay = (delay * 2).min(Duration::from_secs(30));
+    }
+    status.lock().unwrap().state = "disconnected".into();
+}
+
+async fn run_relay_dial(
+    rt: &Runtime,
+    target: &net::PeerTarget,
+    live_key: &str,
+    status: &Mutex<PeerStatus>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    if !claim_live(rt, live_key) {
+        return Ok(());
+    }
+    let result = run_relay_session(rt, target, status, stop).await;
+    release_live(rt, live_key);
+    result
+}
+
+async fn run_relay_session(
+    rt: &Runtime,
+    target: &net::PeerTarget,
+    status: &Mutex<PeerStatus>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let relay_peer = target.relay.as_ref().context("not a relay peer")?;
+    let key = relay_peer.key.context("relay key not resolved")?;
+    let hub_addr = if target.host.contains(':') {
+        format!("[{}]:{}", target.host, target.port)
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+    let tcp = net::connect_peer(target).await?;
+    let pin = tlsutil::load_pin(&rt.zsync_dir, &hub_addr)?;
+    let (cfg, handle) = tlsutil::client_config(pin)?;
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+    let name = tlsutil::server_name(&target.host)?;
+    let tls = connector
+        .connect(name, tcp)
+        .await
+        .context("tls handshake with relay")?;
+    if pin.is_none() {
+        if let Some(got) = handle.observed() {
+            tlsutil::save_pin(&rt.zsync_dir, &hub_addr, &got)?;
+            tracing::info!(hub = %hub_addr, "pinned relay certificate");
+        }
+    }
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let join = relay::Join {
+        group_id: group::hex_encode(&relay_peer.group_id),
+        device_id: rt.hub.node_id().to_string(),
+        hostname: config::hostname(),
+        version: config::crate_version().into(),
+    };
+    relay::write_json(&mut writer, relay::Type::Join, &join).await?;
+    let (typ, payload) = relay::read_frame(&mut reader).await?;
+    match typ {
+        relay::Type::JoinAck => {
+            let ack: relay::JoinAck = serde_json::from_slice(&payload)?;
+            if !ack.ok {
+                bail!("join rejected: {}", ack.message);
+            }
+        }
+        relay::Type::Error => {
+            let err: relay::ErrorMsg = serde_json::from_slice(&payload)
+                .unwrap_or(relay::ErrorMsg {
+                    code: "error".into(),
+                    message: String::from_utf8_lossy(&payload).into(),
+                });
+            bail!("join {}: {}", err.code, err.message);
+        }
+        other => bail!("expected JoinAck, got {other:?}"),
+    }
+    {
+        let mut s = status.lock().unwrap();
+        s.state = "connected".into();
+        s.remote_host = Some(hub_addr);
+        s.last_error = None;
+    }
+    let sender = group::sender_from_node_id(rt.hub.node_id())?;
+    let mut counter = 0u64;
+    let mut rx = rt.hub.subscribe();
+    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    let _ = relay::write_frame(&mut writer, relay::Type::Bye, &[]).await;
+                    break;
+                }
+            }
+            _ = ping.tick() => {
+                relay::write_frame(&mut writer, relay::Type::Ping, &[]).await?;
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Ok(out) if out.skip.is_none() => {
+                        counter = counter.wrapping_add(1);
+                        let body = protocol::encode_clip_body(&out.clip)?;
+                        let env = group::seal(
+                            &key,
+                            &relay_peer.group_id,
+                            &sender,
+                            counter,
+                            &body,
+                        )?;
+                        relay::write_frame(&mut writer, relay::Type::Data, &env).await?;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            frame = relay::read_frame(&mut reader) => {
+                let (typ, payload) = frame?;
+                match typ {
+                    relay::Type::Data => {
+                        let opened = group::open(&key, &relay_peer.group_id, &payload)?;
+                        let clip = protocol::decode_clip(&opened.plaintext)?;
+                        if let Err(e) = protocol::verify_clip(&clip) {
+                            tracing::warn!("drop incomplete clip: {e}");
+                            continue;
+                        }
+                        let from = group::hex_encode(&opened.sender);
+                        rt.hub.apply_from(clip, &from)?;
+                        if let Ok(mut s) = status.lock() {
+                            s.last_sync = Some(unix_now());
+                        }
+                    }
+                    relay::Type::Ping => {
+                        relay::write_frame(&mut writer, relay::Type::Pong, &payload).await?;
+                    }
+                    relay::Type::Pong | relay::Type::JoinAck => {}
+                    relay::Type::Bye | relay::Type::Error => break,
+                    relay::Type::Join => {}
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn framed_loop<R, W>(
@@ -654,15 +824,40 @@ where
                 let (typ, payload) = frame?;
                 match typ {
                     Type::Clip => {
-                        let clip = protocol::decode_clip(&payload)?;
-                        let ack = if let Some(id) = peer_id.as_deref() {
-                            hub.apply_from(clip, id)?
-                        } else {
-                            hub.apply_remote(clip)?
-                        };
-                        protocol::write_json(writer, Type::ClipAck, &ack).await?;
-                        if let Some(st) = status {
-                            st.lock().unwrap().last_sync = Some(unix_now());
+                        match protocol::decode_clip(&payload) {
+                            Ok(clip) => {
+                                let ack = if let Some(id) = peer_id.as_deref()
+                                {
+                                    hub.apply_from(clip, id)?
+                                } else {
+                                    hub.apply_remote(clip)?
+                                };
+                                protocol::write_json(
+                                    writer,
+                                    Type::ClipAck,
+                                    &ack,
+                                )
+                                .await?;
+                                if ack.ok {
+                                    if let Some(st) = status {
+                                        st.lock().unwrap().last_sync =
+                                            Some(unix_now());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("drop incomplete clip: {e}");
+                                protocol::write_json(
+                                    writer,
+                                    Type::ClipAck,
+                                    &protocol::ClipAck {
+                                        hash: String::new(),
+                                        ok: false,
+                                        reason: "truncated".into(),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                     }
                     Type::Ping => {
@@ -699,25 +894,6 @@ where
                 Err(_) => break,
             };
         let body = ipc::read_exact_body(&mut stream, n).await?;
-        if req.action == "pair" {
-            refresh_ticket(&rt).await;
-            let ticket = rt.ticket.lock().unwrap().clone();
-            let resp = if let Some(ticket) = ticket {
-                Response {
-                    ok: true,
-                    ticket: Some(ticket),
-                    ..Response::default()
-                }
-            } else {
-                Response {
-                    ok: false,
-                    error: Some("no ticket yet; retry in a second".into()),
-                    ..Response::default()
-                }
-            };
-            ipc::write_msg(&mut stream, &resp, &[]).await?;
-            continue;
-        }
         let (mut resp, out) = dispatch(&rt, req, body);
         resp.n = out.len();
         ipc::write_msg(&mut stream, &resp, &out).await?;
@@ -742,10 +918,13 @@ fn dispatch(
         "connect" => match req.uri {
             None => err_resp("missing uri"),
             Some(uri) => {
-                let target = match net::parse_peer(&uri) {
+                let mut target = match net::parse_peer(&uri) {
                     Ok(t) => t,
                     Err(e) => return err_resp(&e.to_string()),
                 };
+                if let Err(e) = net::resolve_relay(&rt.zsync_dir, &mut target) {
+                    return err_resp(&e.to_string());
+                }
                 let stored = target.uri.clone();
                 if let Err(e) = rt.state.upsert_peer(&stored, true) {
                     return err_resp(&e.to_string());
@@ -800,9 +979,6 @@ fn dispatch(
         "paste" => match rt.hub.snapshot() {
             Ok(Some(item)) => {
                 let headless = rt.hub.clipboard().headless();
-                let want_path = req.path_only.unwrap_or(false);
-                let want_content = req.content_only.unwrap_or(false);
-                let use_path = want_path || (headless && !want_content);
                 let path = {
                     let p = rt.hub.clipboard().current_path();
                     if p.as_os_str().is_empty() {
@@ -811,30 +987,22 @@ fn dispatch(
                         Some(p.to_string_lossy().into_owned())
                     }
                 };
-                if use_path {
-                    (
-                        Response {
-                            ok: true,
-                            mime: Some(item.mime),
-                            path,
-                            headless: Some(headless),
-                            ..Response::default()
+                (
+                    Response {
+                        ok: true,
+                        mime: Some(item.mime.clone()),
+                        path,
+                        headless: Some(headless),
+                        n: item.data.len(),
+                        name: if item.name.is_empty() {
+                            None
+                        } else {
+                            Some(item.name.clone())
                         },
-                        Vec::new(),
-                    )
-                } else {
-                    (
-                        Response {
-                            ok: true,
-                            mime: Some(item.mime.clone()),
-                            path,
-                            headless: Some(headless),
-                            n: item.data.len(),
-                            ..Response::default()
-                        },
-                        item.data,
-                    )
-                }
+                        ..Response::default()
+                    },
+                    item.data,
+                )
             }
             Ok(None) => err_resp("clipboard is empty"),
             Err(e) => err_resp(&e.to_string()),
@@ -880,7 +1048,7 @@ fn collect_status(rt: &Runtime) -> StatusPayload {
                 Some(p.to_string_lossy().into_owned())
             }
         },
-        ticket: rt.ticket.lock().unwrap().clone(),
+        port: rt.port,
         peers,
     }
 }

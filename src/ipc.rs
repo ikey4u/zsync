@@ -64,7 +64,7 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ticket: Option<String>,
+    pub name: Option<String>,
     #[serde(skip)]
     pub body: Vec<u8>,
 }
@@ -83,8 +83,8 @@ pub struct StatusPayload {
     pub current_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ticket: Option<String>,
+    #[serde(default)]
+    pub port: u16,
     #[serde(default)]
     pub peers: Vec<PeerStatus>,
 }

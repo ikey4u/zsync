@@ -24,6 +24,8 @@ struct Current {
     size: usize,
     #[serde(default)]
     path: String,
+    #[serde(default)]
+    name: String,
 }
 
 impl FileBackend {
@@ -48,6 +50,16 @@ impl FileBackend {
     fn objects(&self) -> PathBuf {
         self.dir.join("clips").join("objects")
     }
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 impl Backend for FileBackend {
@@ -81,6 +93,7 @@ impl Backend for FileBackend {
             hash: cur.hash,
             path: PathBuf::from(cur.path),
             data,
+            name: cur.name,
         }))
     }
 
@@ -98,11 +111,11 @@ impl Backend for FileBackend {
         } else {
             item.hash.clone()
         };
-        fs::write(self.objects().join(&h), &item.data)?;
+        write_atomic(&self.objects().join(&h), &item.data)?;
 
         let ext = ext_for_mime(&mime);
         let stable = self.dir.join("clips").join(format!("current{ext}"));
-        fs::write(&stable, &item.data)?;
+        write_atomic(&stable, &item.data)?;
 
         if let Ok(entries) = fs::read_dir(self.dir.join("clips")) {
             for e in entries.flatten() {
@@ -117,20 +130,33 @@ impl Backend for FileBackend {
             }
         }
 
-        let abs = stable.canonicalize().unwrap_or(stable);
+        let drop_dir = self.dir.join("clips").join("drop");
+        let _ = fs::remove_dir_all(&drop_dir);
+        let offer = if !item.name.is_empty() {
+            fs::create_dir_all(&drop_dir)?;
+            let dest = drop_dir.join(&item.name);
+            write_atomic(&dest, &item.data)?;
+            dest
+        } else {
+            stable.clone()
+        };
+
+        let abs = offer.canonicalize().unwrap_or(offer);
         let stored = Item {
             mime: mime.clone(),
             data: item.data.clone(),
             hash: h.clone(),
             path: abs.clone(),
+            name: item.name.clone(),
         };
         let cur = Current {
             hash: h,
             mime,
             size: item.data.len(),
             path: abs.to_string_lossy().into_owned(),
+            name: item.name.clone(),
         };
-        fs::write(self.meta_path(), serde_json::to_vec_pretty(&cur)?)?;
+        write_atomic(&self.meta_path(), &serde_json::to_vec_pretty(&cur)?)?;
         *self.cur.lock().unwrap() = cur;
         Ok(stored)
     }

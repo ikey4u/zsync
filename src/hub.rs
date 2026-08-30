@@ -100,7 +100,7 @@ impl Hub {
             return Ok(None);
         }
         self.suppress.lock().unwrap().add(&h);
-        let clip = self.pack(item.mime, item.data, h)?;
+        let clip = self.pack(item.mime, item.name, item.data, h)?;
         self.emit(clip.clone(), None);
         Ok(Some(clip))
     }
@@ -117,12 +117,27 @@ impl Hub {
         self.suppress.lock().unwrap().add(&item.hash);
         let stored = self.clipboard.set(&item)?;
         self.suppress.lock().unwrap().add(&stored.hash);
-        let clip = self.pack(stored.mime, stored.data, stored.hash)?;
+        let clip =
+            self.pack(stored.mime, stored.name, stored.data, stored.hash)?;
         self.emit(clip.clone(), None);
         Ok(clip)
     }
 
     pub fn apply_remote(&self, clip: Clip) -> Result<ClipAck> {
+        if let Err(e) = protocol::verify_clip(&clip) {
+            tracing::warn!("drop incomplete clip: {e}");
+            return Ok(ClipAck {
+                hash: clip.meta.hash,
+                ok: false,
+                reason: match e {
+                    protocol::ProtoError::TooLarge => "too-large".into(),
+                    protocol::ProtoError::SizeMismatch { .. } => {
+                        "truncated".into()
+                    }
+                    _ => "hash-mismatch".into(),
+                },
+            });
+        }
         if clip.meta.origin_id == self.node_id {
             return Ok(ClipAck {
                 hash: clip.meta.hash,
@@ -130,21 +145,7 @@ impl Hub {
                 reason: "own-origin".into(),
             });
         }
-        if clip.data.len() > MAX_CLIP || clip.meta.size > MAX_CLIP {
-            return Ok(ClipAck {
-                hash: clip.meta.hash,
-                ok: false,
-                reason: "too-large".into(),
-            });
-        }
-        let actual_hash = hash(&clip.data);
-        if actual_hash != clip.meta.hash {
-            return Ok(ClipAck {
-                hash: clip.meta.hash,
-                ok: false,
-                reason: "hash-mismatch".into(),
-            });
-        }
+        let actual_hash = clip.meta.hash.clone();
         if !self
             .seen
             .lock()
@@ -173,6 +174,7 @@ impl Hub {
             data: clip.data,
             hash: actual_hash.clone(),
             path: std::path::PathBuf::new(),
+            name: clip.meta.name.clone(),
         };
         let stored = self.clipboard.set(&item)?;
         self.suppress.lock().unwrap().add(&stored.hash);
@@ -198,7 +200,13 @@ impl Hub {
         self.clipboard.get()
     }
 
-    fn pack(&self, mime: String, data: Vec<u8>, h: String) -> Result<Clip> {
+    fn pack(
+        &self,
+        mime: String,
+        name: String,
+        data: Vec<u8>,
+        h: String,
+    ) -> Result<Clip> {
         let seq = self.state.next_seq().context("persist seq")?;
         let mime = if mime.is_empty() {
             protocol::detect_mime(&data)
@@ -212,6 +220,7 @@ impl Hub {
                 mime,
                 hash: h,
                 size: data.len(),
+                name,
             },
             data,
         })
@@ -261,6 +270,7 @@ mod tests {
                 mime: "text/plain".into(),
                 hash: hash(&data),
                 size: data.len(),
+                name: String::new(),
             },
             data,
         };
@@ -288,6 +298,7 @@ mod tests {
                 mime: "text/plain".into(),
                 hash: hash(&data),
                 size: data.len(),
+                name: String::new(),
             },
             data: data.clone(),
         };
@@ -341,6 +352,7 @@ mod tests {
                 mime: "text/plain".into(),
                 hash: hash(&data),
                 size: data.len(),
+                name: String::new(),
             },
             data,
         };
@@ -348,5 +360,52 @@ mod tests {
         let out = rx.try_recv().expect("hub must fan out to other peers");
         assert_eq!(out.skip.as_deref(), Some("mac"));
         assert_eq!(out.clip.data, b"from-mac");
+    }
+
+    #[test]
+    fn truncated_clip_never_hits_clipboard() {
+        let mem = Arc::new(Memory::new());
+        let hub = Hub::new(
+            "b".into(),
+            Arc::clone(&mem) as Arc<dyn Backend>,
+            temp_state(),
+            Duration::from_secs(5),
+        );
+        let mut rx = hub.subscribe();
+        let data = b"complete-payload".to_vec();
+        let mut clip = Clip {
+            meta: ClipMeta {
+                origin_id: "a".into(),
+                seq: 1,
+                mime: "text/plain".into(),
+                hash: hash(&data),
+                size: data.len(),
+                name: String::new(),
+            },
+            data: data.clone(),
+        };
+        clip.data.pop();
+        let ack = hub.apply_from(clip, "a").unwrap();
+        assert!(!ack.ok);
+        assert_eq!(ack.reason, "truncated");
+        assert!(hub.snapshot().unwrap().is_none());
+        assert!(rx.try_recv().is_err(), "must not fan out a truncated clip");
+
+        let mut bad = Clip {
+            meta: ClipMeta {
+                origin_id: "a".into(),
+                seq: 2,
+                mime: "text/plain".into(),
+                hash: hash(&data),
+                size: data.len(),
+                name: String::new(),
+            },
+            data,
+        };
+        bad.data[0] ^= 1;
+        let ack = hub.apply_remote(bad).unwrap();
+        assert!(!ack.ok);
+        assert_eq!(ack.reason, "hash-mismatch");
+        assert!(hub.snapshot().unwrap().is_none());
     }
 }

@@ -1,12 +1,12 @@
 # zsync 架构设计
 
 > [!NOTE] 文档状态
-> **v0.2**：每台机器都是对等节点。主路径是 **iroh QUIC**：UDP 打洞直连，打不通则走端到端加密的公共中继。不需要自建 Linux 中转，也不走 SSH。
+> **v0.3**：每台机器都是对等节点。主路径是 **TCP 直连**（默认端口 43721）。`zsync pair` 打印本机 IP，对端 `zsync connect <ip>`。跨网需要对端 IP 可达（局域网、公网、或端口转发）。不走 SSH、不用 iroh。
 > 预览：`pagemd view -i docs/design/ARCH.md`。
 
-**一句话**：两端各跑 `zsync daemon`，用票证配对；复制内容经 QUIC 同步，载荷 ≤ 10 MiB；无头节点落盘，粘贴打路径。
+**一句话**：两端各跑 `zsync daemon`，用 IP:端口配对；复制内容经 TCP 同步，载荷 ≤ 10 MiB；无头节点落盘，粘贴打路径。
 
-**不做**：不要求用户自建中转服务器、不把 RDP 当传输、不自己实现 STUN/ICE、不把剪贴板正文写进日志。
+**不做**：不引入 iroh/打洞中继、不把 RDP 当传输、不把剪贴板正文写进日志。
 
 ---
 
@@ -16,7 +16,7 @@
 
 | 约束 | 选择 |
 |---|---|
-| 传输 | iroh：QUIC/UDP 打洞，失败则加密中继 |
+| 传输 | TCP 直连，默认端口 43721 |
 | 体积 | 单条载荷 ≤ 10 MiB，超出静默丢弃并记 status 错误 |
 | 无头 | 无 GUI 时走文件后端；`zsync paste` 打出路径 |
 | 守护进程 | 用户显式 `zsync daemon`，CLI 不偷偷拉起 |
@@ -26,8 +26,8 @@
 A 写入 B 的剪贴板 → B 的 watcher 当成「本地新复制」→ 再发给 A → 无限振荡。协议必须把 **用户手势** 和 **程序写入** 分开。
 :::
 
-:::note 为什么不是「纯打洞、零服务器」
-对称 NAT / 企业防火墙下，UDP 打洞会失败。成熟栈（iroh、libp2p DCUtR、WebRTC ICE）都保留 **信令 + 中继兜底**。iroh 的中继只转发已经 QUIC 加密的包，读不到剪贴板；这和「自己跑一台 Linux 当 zsync Hub」不是一回事。同一局域网通常直接打通，中继不参与数据面。
+:::note 可达性
+两端必须能 TCP 连上（同一局域网最简单）。跨 NAT 需要公网 IP、端口转发，或一边本来就能连到另一边（例如 SSH 进的那台 Linux）。
 :::
 
 ---
@@ -38,25 +38,25 @@ A 写入 B 的剪贴板 → B 的 watcher 当成「本地新复制」→ 再发�
 flowchart LR
   U[用户] --> D["zsync daemon"]
   U --> P["zsync pair"]
-  U --> C["zsync connect TICKET"]
+  U --> C["zsync connect IP"]
   U --> S["zsync status"]
   U --> K["zsync c / zsync p"]
   D -.IPC.-> P
   D -.IPC.-> C
   D -.IPC.-> S
   D -.IPC.-> K
-  C -->|"QUIC 打洞 / 中继"| Peer[对端 daemon]
+  C -->|"TCP"| Peer[对端 daemon]
 ```
 
 | 命令 | 别名 | 谁执行 | 作用 |
 |---|---|---|---|
-| `zsync daemon` | | 本机 | 后台拉起守护进程，绑定 iroh Endpoint |
+| `zsync daemon` | | 本机 | 后台拉起守护进程，监听 TCP 43721 |
 | `zsync daemon -f` | | 本机 | 前台跑，便于调试 |
 | `zsync daemon stop` | | 本机 | 停守护进程 |
-| `zsync pair` | | 本机 | 打印票证（EndpointId + 中继 + 直连地址） |
-| `zsync connect …` | | 本机 | 票证 / `iroh://id` |
+| `zsync pair` | | 本机 | 打印本机 IP:端口 |
+| `zsync connect …` | | 本机 | 对端 IP / 主机名，可带端口 |
 | `zsync disconnect [uri]` | | 本机 | 拆掉对端 |
-| `zsync status` | | 本机 | 守护进程、票证、剪贴板、peer |
+| `zsync status` | | 本机 | 守护进程、node id、剪贴板、peer |
 | `zsync copy` | `c` | 两端 | stdin 或参数 → 本地剪贴板，并作为 **本源 origin** 同步 |
 | `zsync paste` | `p` | 两端 | GUI 打载荷；无头默认打路径 |
 
@@ -68,15 +68,15 @@ flowchart LR
 sequenceDiagram
   actor You
   participant Mac as Mac daemon
-  participant Net as iroh QUIC
+  participant Net as TCP
   participant Win as Windows daemon
 
   You->>Mac: zsync daemon
   You->>Mac: zsync pair
-  Mac-->>You: endpoint…票证
+  Mac-->>You: 192.168.1.5:43721
   You->>Win: zsync daemon
-  You->>Win: zsync connect 票证
-  Win->>Net: dial（先经中继握手）
+  You->>Win: zsync connect 192.168.1.5
+  Win->>Net: dial TCP
   Net->>Mac: accept
   Note over Win,Mac: 同时打洞，成功则切直连 UDP
   Win->>Mac: Hello / HelloAck
@@ -96,7 +96,7 @@ Rust 上能用的栈：
 
 可靠剪贴板需要有序、重传、流控。UDP 打洞之上用 QUIC，比「打出 TCP 再自己做可靠层」更贴现状：TCP 打洞成功率明显更差。
 
-身份是 Ed25519 公钥（EndpointId），存在 `~/.zsync/secret`。票证用 `iroh-tickets` 打包 EndpointId + RelayUrl + 直连地址，复制粘贴一次即可。
+身份是 Ed25519 公钥（EndpointId / node id），存在 `~/.zsync/secret`。配对只交换这串 64 hex：iroh 用 N0 发现解析中继与直连地址，不需要把票证抄过来。票证仍可被 `connect` 解析，但首次配对不能依赖复制。
 
 ### 2.3 Windows 与 RDP
 
@@ -114,11 +114,11 @@ flowchart LR
 
 | 场景 | 怎么连 |
 |---|---|
-| Mac ↔ Windows | 一边 `pair`，另一边 `connect` 票证 |
+| Mac ↔ Windows | 一边 `pair`，另一边 `connect <node id>` |
 | 同一 Wi-Fi | 打洞后直连，中继退出数据面 |
 | 两边都是对称 NAT | 会话留在加密中继上，功能仍可用 |
-| Mac ↔ 无头 Linux | 两边都跑 daemon + 票证 |
-| 人坐在 Mac 上 RDP 进 Windows | 要和家里 Mac 同步：在 **RDP 会话里的 Windows** 上跑 zsync，再 `connect` 票证 |
+| Mac ↔ 无头 Linux | 两边都跑 daemon，再 `connect <node id>` |
+| 人坐在 Mac 上 RDP 进 Windows | 要和家里 Mac 同步：在 **RDP 会话里的 Windows** 上跑 zsync，再 `connect <node id>` |
 
 Hub 转发仍在：一台机器连了多个 peer 时，入口 peer 记为 `skip`，避免 A→本机→A。两台 GUI 直连时每边只有一条边，`apply_from` 不会绕回。
 
@@ -207,7 +207,7 @@ flowchart TB
 | `protocol` | 帧编解码、MIME 嗅探、hash | 不碰剪贴板 |
 | `suppress` | hash TTL+ring、origin seq | 无 IO |
 | `clipboard` | `Backend` trait；native 或 file | 不发网络 |
-| `net` | iroh Endpoint、票证、peer URI | 不解释 Clip |
+| `net` | TCP listen / dial、peer URI | 不解释 Clip |
 | `ipc` | Unix socket / named pipe 上一行 JSON + body | 不打日志写 body |
 | `config` | `~/.zsync` 路径、secret、state.json | |
 
@@ -448,12 +448,12 @@ daemon 启动时对 `enabled` 的 peer 自动重连。`disconnect` 从列表删�
 
 ## 10. P2P 连接与重连
 
-daemon 启动时绑定 iroh Endpoint（`presets::N0`：公共中继 + DNS 地址查找），ALPN = `zsync/1`。`pair` 在 `online()` 之后打印 `EndpointTicket`。
+daemon 启动时绑定 `0.0.0.0:43721`（可用 `ZSYNC_PORT` 改）。`pair` / `status` 打印本机可达 IP。
 
 `connect` 接受：
 
-- 票证（`endpoint…` 字符串）
-- `iroh://<endpoint-id>`
+- `192.168.1.5`（默认端口 43721）
+- `192.168.1.5:43721` / `host.lan` / `[::1]:43721`
 
 同一对 Endpoint 只跑一条 framed 会话（`live` 集合按对端 id 去重）。用户执行的 `connect` **强制 dial**；重启后仅当本机 id 字典序更小才 dial，另一侧只 accept，避免双向互拨拆成两条半连接。
 
@@ -476,7 +476,7 @@ stateDiagram-v2
 
 ## 11. 安全
 
-- 主路径信任边界 = iroh 公钥：只有拿得到票证或 EndpointId 的人能 dial；QUIC/TLS 用该密钥做身份。
+- 主路径信任边界 = iroh 公钥：只有拿得到 EndpointId 的人能 dial；QUIC/TLS 用该密钥做身份。
 - 公共中继只转发密文，看不到 Clip。
 - 日志只记 hash 前 12 位、字节数、MIME、peer URI，不记正文。
 - 不实现「任意文件上传」：只同步剪贴板载荷；无头落盘目录仅 zsync 自己写。
@@ -496,7 +496,7 @@ stateDiagram-v2
 | suppress / seq | `src/suppress.rs` |
 | Hub（observed / push / apply，不回播远端） | `src/hub.rs` |
 | daemon / accept / dial / watcher | `src/daemon.rs` |
-| iroh 票证与 Endpoint | `src/net.rs` |
+| TCP listen / parse IP | `src/net.rs` |
 | IPC JSON+body | `src/ipc.rs` |
 | 路径、secret、state.json | `src/config.rs` |
 | Backend trait / Memory 测试后端 | `src/clipboard/mod.rs` |
@@ -508,9 +508,9 @@ cargo build --release
 # 机器 A
 zsync daemon
 zsync pair
-# 机器 B（把 A 打印的票证贴过来）
+# 机器 B（把 A 打印的 IP 抄过来）
 zsync daemon
-zsync connect endpoint…
+zsync connect 192.168.1.5
 echo hello | zsync c
 zsync p
 zsync status

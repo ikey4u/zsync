@@ -14,8 +14,8 @@ use super::{Backend, FileBackend, Item};
 struct Native {
     name: &'static str,
     file: FileBackend,
-    getter: fn() -> Result<Option<(Vec<u8>, String)>>,
-    setter: fn(&[u8], &str) -> Result<()>,
+    getter: fn() -> Result<Option<Item>>,
+    setter: fn(&Item) -> Result<()>,
 }
 
 impl Backend for Native {
@@ -29,17 +29,34 @@ impl Backend for Native {
         self.file.current_path()
     }
     fn get(&self) -> Result<Option<Item>> {
-        let Some((data, mime)) = (self.getter)()? else {
-            return Ok(None);
-        };
-        if data.is_empty() {
-            return Ok(None);
+        let os = (self.getter)()?;
+        let file = self.file.get().ok().flatten();
+        match (os, file) {
+            (Some(mut os), Some(stored)) if os.hash == stored.hash => {
+                if os.name.is_empty() {
+                    os.name = stored.name;
+                }
+                if os.mime.starts_with("text/")
+                    && !stored.mime.starts_with("text/")
+                {
+                    os.mime = stored.mime;
+                }
+                Ok(Some(os))
+            }
+            (None, Some(stored)) => Ok(Some(stored)),
+            (Some(os), _) => {
+                if os.data.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(os))
+                }
+            }
+            (None, None) => Ok(None),
         }
-        Ok(Some(Item::new(mime, data)))
     }
     fn set(&self, item: &Item) -> Result<Item> {
         let stored = self.file.set(item)?;
-        (self.setter)(&stored.data, &stored.mime)?;
+        (self.setter)(&stored)?;
         Ok(stored)
     }
 }
@@ -146,28 +163,70 @@ fn run_in(bin: &str, args: &[&str], data: &[u8]) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_get() -> Result<Option<(Vec<u8>, String)>> {
-    if let Ok(text) = run_out("pbpaste", &[]) {
-        if !text.is_empty() {
-            return Ok(Some((text, "text/plain".into())));
+fn darwin_get() -> Result<Option<Item>> {
+    let text = run_out("pbpaste", &[]).unwrap_or_default();
+    if let Some(item) = super::item_from_file_text(&text) {
+        return Ok(Some(item));
+    }
+    // Finder copies put the basename on the text flavor and the real path
+    // on «class furl». pbpaste alone would sync the name as text/plain.
+    if super::looks_like_copied_filename(&text) {
+        if let Some(item) = darwin_file_from_furl() {
+            return Ok(Some(item));
         }
     }
+    // Screenshots / "Copy Image": bitmap on PNGf, often a basename or HTML
+    // on the text flavor. Prefer the bitmap when there is no real file.
     if let Ok(Some(png)) = darwin_png() {
-        if !png.is_empty() {
-            return Ok(Some((png, "image/png".into())));
+        if png.starts_with(b"\x89PNG") {
+            return Ok(Some(Item::new("image/png", png)));
         }
+    }
+    if !text.is_empty() {
+        return Ok(Some(Item::new("text/plain", text)));
     }
     Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_set(data: &[u8], mime: &str) -> Result<()> {
-    if mime.starts_with("image/") {
-        let ext = if mime == "image/jpeg" { "jpg" } else { "png" };
+fn darwin_file_from_furl() -> Option<Item> {
+    let script = r#"
+try
+    POSIX path of (the clipboard as «class furl»)
+on error
+    return ""
+end try
+"#;
+    let out = Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout);
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    super::item_from_file_text(path.as_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_set(item: &Item) -> Result<()> {
+    if !item.name.is_empty() && item.path.is_file() {
+        return darwin_set_file(&item.path);
+    }
+    if item.mime.starts_with("image/") {
+        let ext = if item.mime == "image/jpeg" {
+            "jpg"
+        } else {
+            "png"
+        };
         let path = std::env::temp_dir().join(format!("zsync-clip.{ext}"));
-        std::fs::write(&path, data)?;
-        let posix = path.display().to_string();
-        let script = if mime == "image/png" || ext == "png" {
+        std::fs::write(&path, &item.data)?;
+        let posix = applescript_posix(&path);
+        let script = if item.mime == "image/png" || ext == "png" {
             format!(
                 r#"set the clipboard to (read (POSIX file "{posix}") as «class PNGf»)"#
             )
@@ -184,7 +243,26 @@ fn darwin_set(data: &[u8], mime: &str) -> Result<()> {
         }
         return Ok(());
     }
-    run_in("pbcopy", &[], data)
+    run_in("pbcopy", &[], &item.data)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_set_file(path: &Path) -> Result<()> {
+    let posix = applescript_posix(path);
+    let script =
+        format!(r#"set the clipboard to (POSIX file "{posix}" as alias)"#);
+    let status = Command::new("osascript").args(["-e", &script]).status()?;
+    if !status.success() {
+        bail!("osascript failed to set file clipboard");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_posix(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 #[cfg(target_os = "macos")]
@@ -199,10 +277,13 @@ fn darwin_png() -> Result<Option<Vec<u8>>> {
 try
     set png_data to (the clipboard as «class PNGf»)
     set out to open for access POSIX file "{posix}" with write permission
-    write png_data to out
+    set eof of out to 0
+    write png_data to out as «class PNGf»
     close access out
 on error
-    return
+    try
+        close access POSIX file "{posix}"
+    end try
 end try
 "#
     );
@@ -213,96 +294,170 @@ end try
 }
 
 #[cfg(target_os = "linux")]
-fn wayland_get() -> Result<Option<(Vec<u8>, String)>> {
+fn wayland_get() -> Result<Option<Item>> {
     if let Ok(types) = run_out("wl-paste", &["--list-types"]) {
         let list = String::from_utf8_lossy(&types);
-        if list.contains("image/png") && !list.contains("text/plain") {
+        if list.contains("text/uri-list") {
+            if let Ok(b) =
+                run_out("wl-paste", &["--no-newline", "-t", "text/uri-list"])
+            {
+                if let Some(item) = super::item_from_file_text(&b) {
+                    return Ok(Some(item));
+                }
+            }
+        }
+        if list.contains("image/png") {
             if let Ok(b) =
                 run_out("wl-paste", &["--no-newline", "-t", "image/png"])
             {
                 if !b.is_empty() {
-                    return Ok(Some((b, "image/png".into())));
+                    return Ok(Some(Item::new("image/png", b)));
+                }
+            }
+        }
+        for mime in ["application/pdf", "application/zip"] {
+            if list.contains(mime) {
+                if let Ok(b) =
+                    run_out("wl-paste", &["--no-newline", "-t", mime])
+                {
+                    if !b.is_empty() {
+                        return Ok(Some(Item::new(mime, b)));
+                    }
                 }
             }
         }
     }
     match run_out("wl-paste", &["--no-newline"]) {
-        Ok(b) if !b.is_empty() => Ok(Some((b, "text/plain".into()))),
+        Ok(b) if !b.is_empty() => {
+            if let Some(item) = super::item_from_file_text(&b) {
+                return Ok(Some(item));
+            }
+            Ok(Some(Item::new("text/plain", b)))
+        }
         _ => Ok(None),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn wayland_set(data: &[u8], mime: &str) -> Result<()> {
-    if mime.starts_with("image/") {
-        return run_in("wl-copy", &["-t", mime], data);
+fn wayland_set(item: &Item) -> Result<()> {
+    if !item.name.is_empty() && item.path.is_file() {
+        let uri = super::file_uri(&item.path);
+        return run_in("wl-copy", &["-t", "text/uri-list"], uri.as_bytes());
     }
-    run_in("wl-copy", &[], data)
+    if !item.mime.is_empty() && !item.mime.starts_with("text/plain") {
+        return run_in("wl-copy", &["-t", &item.mime], &item.data);
+    }
+    run_in("wl-copy", &[], &item.data)
 }
 
 #[cfg(target_os = "linux")]
-fn xclip_get() -> Result<Option<(Vec<u8>, String)>> {
+fn xclip_get() -> Result<Option<Item>> {
     if let Ok(targets) =
         run_out("xclip", &["-selection", "clipboard", "-o", "-t", "TARGETS"])
     {
         let t = String::from_utf8_lossy(&targets);
-        if t.contains("image/png")
-            && !t.contains("UTF8_STRING")
-            && !t.contains("text/plain")
-        {
+        if t.contains("text/uri-list") {
+            if let Ok(b) = run_out(
+                "xclip",
+                &["-selection", "clipboard", "-o", "-t", "text/uri-list"],
+            ) {
+                if let Some(item) = super::item_from_file_text(&b) {
+                    return Ok(Some(item));
+                }
+            }
+        }
+        if t.contains("image/png") {
             if let Ok(b) = run_out(
                 "xclip",
                 &["-selection", "clipboard", "-o", "-t", "image/png"],
             ) {
                 if !b.is_empty() {
-                    return Ok(Some((b, "image/png".into())));
+                    return Ok(Some(Item::new("image/png", b)));
+                }
+            }
+        }
+        for mime in ["application/pdf", "application/zip"] {
+            if t.contains(mime) {
+                if let Ok(b) = run_out(
+                    "xclip",
+                    &["-selection", "clipboard", "-o", "-t", mime],
+                ) {
+                    if !b.is_empty() {
+                        return Ok(Some(Item::new(mime, b)));
+                    }
                 }
             }
         }
     }
     match run_out("xclip", &["-selection", "clipboard", "-o"]) {
-        Ok(b) if !b.is_empty() => Ok(Some((b, "text/plain".into()))),
+        Ok(b) if !b.is_empty() => {
+            if let Some(item) = super::item_from_file_text(&b) {
+                return Ok(Some(item));
+            }
+            Ok(Some(Item::new("text/plain", b)))
+        }
         _ => Ok(None),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn xclip_set(data: &[u8], mime: &str) -> Result<()> {
-    if mime.starts_with("image/") {
-        return run_in("xclip", &["-selection", "clipboard", "-t", mime], data);
+fn xclip_set(item: &Item) -> Result<()> {
+    if !item.name.is_empty() && item.path.is_file() {
+        let uri = super::file_uri(&item.path);
+        return run_in(
+            "xclip",
+            &["-selection", "clipboard", "-t", "text/uri-list"],
+            uri.as_bytes(),
+        );
     }
-    run_in("xclip", &["-selection", "clipboard"], data)
+    if !item.mime.is_empty() && !item.mime.starts_with("text/plain") {
+        return run_in(
+            "xclip",
+            &["-selection", "clipboard", "-t", &item.mime],
+            &item.data,
+        );
+    }
+    run_in("xclip", &["-selection", "clipboard"], &item.data)
 }
 
 #[cfg(target_os = "linux")]
-fn xsel_get() -> Result<Option<(Vec<u8>, String)>> {
+fn xsel_get() -> Result<Option<Item>> {
     match run_out("xsel", &["--clipboard", "--output"]) {
-        Ok(b) if !b.is_empty() => Ok(Some((b, "text/plain".into()))),
+        Ok(b) if !b.is_empty() => {
+            if let Some(item) = super::item_from_file_text(&b) {
+                return Ok(Some(item));
+            }
+            Ok(Some(Item::new("text/plain", b)))
+        }
         _ => Ok(None),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn xsel_set(data: &[u8], _mime: &str) -> Result<()> {
-    run_in("xsel", &["--clipboard", "--input"], data)
+fn xsel_set(item: &Item) -> Result<()> {
+    run_in("xsel", &["--clipboard", "--input"], &item.data)
 }
 
 #[cfg(target_os = "windows")]
-fn windows_get() -> Result<Option<(Vec<u8>, String)>> {
+fn windows_get() -> Result<Option<Item>> {
     match clipboard_win::get_clipboard_string() {
         Ok(s) if !s.is_empty() => {
-            Ok(Some((s.into_bytes(), "text/plain".into())))
+            let bytes = s.into_bytes();
+            if let Some(item) = super::item_from_file_text(&bytes) {
+                return Ok(Some(item));
+            }
+            Ok(Some(Item::new("text/plain", bytes)))
         }
         _ => Ok(None),
     }
 }
 
 #[cfg(target_os = "windows")]
-fn windows_set(data: &[u8], mime: &str) -> Result<()> {
-    if mime.starts_with("image/") {
+fn windows_set(item: &Item) -> Result<()> {
+    if item.mime.starts_with("image/") || !item.name.is_empty() {
         return Ok(());
     }
-    let text = String::from_utf8_lossy(data);
+    let text = String::from_utf8_lossy(&item.data);
     clipboard_win::set_clipboard_string(&text)
         .map_err(|e| anyhow::anyhow!("set clipboard: {e}"))
 }

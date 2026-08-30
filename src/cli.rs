@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{self, Write},
     path::PathBuf,
 };
@@ -19,6 +20,9 @@ const CLIPBOARD_HELP: &str = "\
 Clipboard in editors
   Remote Linux has no X11 clipboard. Point the editor at zsync (daemon must
   be running). `zsync p` prints a file path; editors must use --content.
+  Images and files: `zsync p` writes them into the current directory
+  (original filename when known, otherwise zsync-clip.*) and prints the
+  absolute path.
 
   Neovim  ~/.config/nvim/init.lua
     vim.g.clipboard = {
@@ -46,7 +50,7 @@ Clipboard in editors
     Copy mode yank and Prefix+] already call zsync when `zsync` is on PATH
     (also ~/.local/bin and ~/.cargo/bin). Pane OSC 52 is relayed and also
     copied into zsync. For Neovim inside a zmux pane, use the zsync provider
-    above (not osc52). Both machines need `zsync daemon` and a one-time pair.
+    above (not osc52). Both machines need `zsync daemon` and `zsync connect`.
 
   Optional xclip shim
     ln -sf \"$(command -v zsync)\" ~/.local/bin/xclip
@@ -56,7 +60,7 @@ Clipboard in editors
 #[command(
     name = "zsync",
     version = ZSYNC_VERSION,
-    about = "Clipboard sync over QUIC (hole punching)",
+    about = "Clipboard sync over TCP or an encrypted relay",
     after_long_help = CLIPBOARD_HELP,
     disable_help_subcommand = false
 )]
@@ -75,11 +79,9 @@ enum Commands {
         #[arg(long, short = 'f', global = true)]
         foreground: bool,
     },
-    /// Print a ticket the other machine can `zsync connect`
-    Pair,
-    /// Connect to a peer (iroh ticket or iroh://id)
+    /// Connect to a LAN peer (`host[:port]`) or a `zsync://` URI from zsyncd
     Connect {
-        /// Ticket from `zsync pair`, or iroh://endpoint-id
+        /// Address: `host[:port]` or `zsync://group_id:key@ip:port`
         uri: String,
     },
     /// Drop a saved peer
@@ -92,7 +94,7 @@ enum Commands {
         /// Text to copy. If omitted and stdin is a pipe, read stdin.
         text: Vec<String>,
     },
-    /// Paste the current clip (content on GUI, path on headless)
+    /// Paste: files/images land in the current directory; text prints as before
     #[command(visible_alias = "p")]
     Paste {
         /// Always print the on-disk path
@@ -127,7 +129,6 @@ pub async fn run() -> Result<()> {
             None if foreground => daemon::run_foreground().await,
             None => daemon::start(),
         },
-        Commands::Pair => pair().await,
         Commands::Connect { uri } => connect(&uri).await,
         Commands::Disconnect { uri } => disconnect(uri.as_deref()).await,
         Commands::Status => status().await,
@@ -137,32 +138,12 @@ pub async fn run() -> Result<()> {
     }
 }
 
-async fn pair() -> Result<()> {
-    let mut conn = ipc::connect(&Paths::resolve()?)
-        .await
-        .context("daemon is not running; start it with `zsync daemon`")?;
-    let resp = conn
-        .roundtrip(
-            &Request {
-                action: "pair".into(),
-                ..Request::default()
-            },
-            &[],
-        )
-        .await?;
-    if !resp.ok {
-        bail!("{}", resp.error.unwrap_or_else(|| "pair failed".into()));
-    }
-    let ticket = resp.ticket.context("daemon returned no ticket")?;
-    println!("{ticket}");
-    eprintln!("on the other machine: zsync connect <this-ticket>");
-    Ok(())
-}
-
 async fn connect(uri: &str) -> Result<()> {
-    let target = crate::net::parse_peer(uri)?;
+    let mut target = crate::net::parse_peer(uri)?;
+    let paths = Paths::resolve()?;
+    crate::net::resolve_relay(&paths.dir, &mut target)?;
     let stored = target.uri.clone();
-    let mut conn = ipc::connect(&Paths::resolve()?)
+    let mut conn = ipc::connect(&paths)
         .await
         .context("daemon is not running; start it with `zsync daemon`")?;
     let resp = conn
@@ -178,7 +159,16 @@ async fn connect(uri: &str) -> Result<()> {
     if !resp.ok {
         bail!("{}", resp.error.unwrap_or_else(|| "connect failed".into()));
     }
-    println!("connecting {stored}");
+    if let Some(r) = &target.relay {
+        println!(
+            "connecting {} via {}:{}",
+            crate::group::hex_encode(&r.group_id),
+            target.host,
+            target.port
+        );
+    } else {
+        println!("connecting {stored}");
+    }
     Ok(())
 }
 
@@ -230,10 +220,7 @@ async fn status() -> Result<()> {
         bail!("daemon returned empty status");
     };
     println!("daemon:    running (pid {})", st.daemon_pid);
-    println!("node:      {}", st.node_id);
-    if let Some(t) = &st.ticket {
-        println!("ticket:    {t}");
-    }
+    println!("listen:    0.0.0.0:{}", st.port);
     println!(
         "clipboard: {}{}",
         st.clipboard,
@@ -256,7 +243,7 @@ async fn status() -> Result<()> {
         println!("peers:     none");
     }
     for p in st.peers {
-        println!("peer:      {}", p.uri);
+        println!("peer:      {}", crate::net::display_uri(&p.uri));
         println!("           state: {}", p.state);
         if let Some(n) = p.remote_node {
             println!("           remote: {n}");
@@ -308,6 +295,7 @@ async fn put_clipboard(data: Vec<u8>) -> Result<()> {
         data,
         hash: String::new(),
         path: PathBuf::new(),
+        name: String::new(),
     };
     backend.set(&item)?;
     Ok(())
@@ -370,6 +358,11 @@ async fn paste(want_path: bool, want_content: bool) -> Result<()> {
             }
         },
         headless: Some(backend.headless()),
+        name: if item.name.is_empty() {
+            None
+        } else {
+            Some(item.name.clone())
+        },
         body: item.data,
         ..ipc::Response::default()
     };
@@ -381,6 +374,28 @@ fn write_paste(
     want_content: bool,
     resp: &ipc::Response,
 ) -> Result<()> {
+    let mime = resp.mime.as_deref().unwrap_or("");
+    let name = resp.name.as_deref().unwrap_or("");
+    let sniffed = if resp.body.is_empty() {
+        String::new()
+    } else {
+        detect_mime(&resp.body)
+    };
+    let is_file = clipboard::should_write_file(name, mime, &resp.body)
+        || clipboard::should_write_file(name, &sniffed, &resp.body);
+    if is_file && !want_content {
+        let data = if !resp.body.is_empty() {
+            resp.body.clone()
+        } else if let Some(p) = &resp.path {
+            fs::read(p).with_context(|| format!("read {p}"))?
+        } else {
+            bail!("file clip has no data");
+        };
+        let cwd = std::env::current_dir().context("current directory")?;
+        let dest = clipboard::write_clip_file(&cwd, name, mime, &data)?;
+        println!("{}", dest.display());
+        return Ok(());
+    }
     let headless = resp.headless.unwrap_or(false);
     let use_path = want_path || (headless && !want_content);
     if use_path {

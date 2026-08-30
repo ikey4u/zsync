@@ -21,10 +21,24 @@ tools = { rust = "nightly" }
 run = "cargo fmt --all"
 
 [tasks.release]
-description = "Release-zip macOS / Linux / Windows: native cargo on the host OS, cargo-zigbuild elsewhere"
+description = "Release-zip zsync (macOS / Linux / Windows) and zsyncd Linux x64 glibc 2.17"
 alias = ["dist"]
 tools = { zig = "0.14.0", "cargo:cargo-zigbuild" = "0.20.1" }
 run = "bash scripts/release.sh"
+
+[tasks."release:macos:arm64"]
+description = "Release-zip macOS arm64 only"
+run = "bash scripts/release.sh macos:arm64"
+
+[tasks."release:linux:x64"]
+description = "Release-zip Linux x64 only (glibc 2.17 via zigbuild when not native)"
+tools = { zig = "0.14.0", "cargo:cargo-zigbuild" = "0.20.1" }
+run = "bash scripts/release.sh linux:x64"
+
+[tasks."release:zsyncd"]
+description = "Release-zip zsyncd Linux x64 only (glibc 2.17)"
+tools = { zig = "0.14.0", "cargo:cargo-zigbuild" = "0.20.1" }
+run = "bash scripts/release.sh zsyncd"
 
 [tasks."release:clean"]
 description = "Remove release zip artifacts and the isolated cargo target cache"

@@ -86,16 +86,14 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 pub fn load_or_create_node_id(paths: &Paths) -> Result<String> {
-    let secret = crate::net::load_or_create_secret(&paths.secret)?;
-    let id = secret.public().to_string();
-    if fs::read_to_string(&paths.node_id)
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        != Some(id.as_str())
-    {
-        fs::write(&paths.node_id, format!("{id}\n"))?;
+    if let Ok(s) = fs::read_to_string(&paths.node_id) {
+        let id = s.trim();
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
     }
+    let id = crate::protocol::new_node_id();
+    fs::write(&paths.node_id, format!("{id}\n"))?;
     Ok(id)
 }
 
