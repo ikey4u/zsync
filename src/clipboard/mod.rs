@@ -79,6 +79,7 @@ pub(crate) fn looks_like_copied_filename(text: &[u8]) -> bool {
 }
 
 /// `text/uri-list` body for a local file (trailing newline per RFC 2483).
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn file_uri(path: &Path) -> String {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let raw = abs.to_string_lossy();

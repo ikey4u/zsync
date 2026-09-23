@@ -232,7 +232,7 @@ async fn status() -> Result<()> {
             st.current_bytes.unwrap_or(0),
             st.current_hash
                 .as_deref()
-                .map(|h| &h[..h.len().min(12)])
+                .map(|h| h.get(..h.len().min(12)).unwrap_or(h))
                 .unwrap_or("-")
         );
     }

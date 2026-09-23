@@ -128,11 +128,17 @@ fn split_host_port(s: &str) -> Result<(String, u16)> {
         return Ok((host.to_string(), port));
     }
     match s.rfind(':') {
-        Some(i) if s[..i].contains(':') => Ok((s.to_string(), DEFAULT_PORT)),
+        Some(i) if s.split_at(i).0.contains(':') => {
+            Ok((s.to_string(), DEFAULT_PORT))
+        }
         Some(i) => {
-            let host = s[..i].to_string();
-            let port: u16 = s[i + 1..].parse().context("invalid port")?;
-            Ok((host, port))
+            let (host, port) = s.split_at(i);
+            let port: u16 = port
+                .strip_prefix(':')
+                .expect("split at colon")
+                .parse()
+                .context("invalid port")?;
+            Ok((host.to_string(), port))
         }
         None => Ok((s.to_string(), DEFAULT_PORT)),
     }

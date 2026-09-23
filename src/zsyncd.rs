@@ -154,10 +154,7 @@ impl DaemonPaths {
 }
 
 fn is_running(paths: &DaemonPaths) -> bool {
-    match crate::config::read_pid(&paths.pid) {
-        Some(pid) if crate::config::pid_alive(pid) => true,
-        _ => false,
-    }
+    matches!(crate::config::read_pid(&paths.pid), Some(pid) if crate::config::pid_alive(pid))
 }
 
 fn cleanup_stale(paths: &DaemonPaths) {
@@ -942,18 +939,13 @@ fn start_admin(sock: PathBuf, srv: Arc<Server>) -> Result<()> {
                 fs::set_permissions(&sock, fs::Permissions::from_mode(0o600));
         }
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let srv = Arc::clone(&srv);
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_admin(stream, srv).await {
-                                tracing::debug!("admin: {e:#}");
-                            }
-                        });
+            while let Ok((stream, _)) = listener.accept().await {
+                let srv = Arc::clone(&srv);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_admin(stream, srv).await {
+                        tracing::debug!("admin: {e:#}");
                     }
-                    Err(_) => break,
-                }
+                });
             }
         });
     }

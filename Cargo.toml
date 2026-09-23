@@ -6,6 +6,14 @@ description = "Clipboard sync over an encrypted relay"
 license = "MIT"
 build = "build.rs"
 
+[workspace]
+
+[workspace.lints.clippy]
+string_slice = "deny"
+
+[lints]
+workspace = true
+
 [[bin]]
 name = "zsync"
 path = "src/bin/zsync.rs"

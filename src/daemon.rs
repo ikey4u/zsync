@@ -44,10 +44,7 @@ struct PeerEntry {
 }
 
 pub fn is_running(paths: &Paths) -> bool {
-    match read_pid(&paths.pid) {
-        Some(pid) if pid_alive(pid) => true,
-        _ => false,
-    }
+    matches!(read_pid(&paths.pid), Some(pid) if pid_alive(pid))
 }
 
 fn cleanup_stale(paths: &Paths) {
@@ -402,7 +399,14 @@ fn stop_peer(rt: &Arc<Runtime>, uri: &str) {
 fn short_err(e: &anyhow::Error) -> String {
     let s = format!("{e:#}");
     if s.len() > 200 {
-        format!("{}…", &s[..200])
+        let shortened: String = s
+            .chars()
+            .scan(0, |bytes, ch| {
+                *bytes += ch.len_utf8();
+                (*bytes <= 200).then_some(ch)
+            })
+            .collect();
+        format!("{shortened}…")
     } else {
         s
     }

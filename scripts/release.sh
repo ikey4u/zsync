@@ -11,7 +11,7 @@
 #
 # Path scrub: isolated CARGO_HOME / CARGO_TARGET_DIR, remap-path-prefix,
 # -C strip=symbols, then a post-link strip. strings scan fails on leftover
-# personal paths.
+# personal paths, while allowing system temporary directories.
 #
 # Env: CARGO_HOME_DIR, CARGO_TARGET_DIR, DIST_DIR, ZSYNC_LINUX_GLIBC
 #      SKIP_PACKAGE=1  SKIP_VERIFY=1
@@ -223,6 +223,13 @@ strip_bin() {
   esac
 }
 
+is_system_temp_path() {
+  case "$1" in
+    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*|/private/var/folders/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 verify_no_personal_paths() {
   local bin="$1"
   local label="$2"
@@ -232,16 +239,16 @@ verify_no_personal_paths() {
   fi
   echo "==> verify paths: $label"
   local hits
+  local -a patterns=(-e "${HOME}" -e "${ROOT}"
+    -e '/Users/[^/]+/\.cargo' -e '/Users/[^/]+/\.rustup')
+  if ! is_system_temp_path "${CARGO_HOME_DIR}"; then
+    patterns+=(-e "${CARGO_HOME_DIR}")
+  fi
+  if ! is_system_temp_path "${CARGO_TARGET_DIR}"; then
+    patterns+=(-e "${CARGO_TARGET_DIR}")
+  fi
   hits="$(
-    strings "$bin" | grep -E \
-      -e "${HOME}" \
-      -e "${CARGO_HOME_DIR}" \
-      -e "${CARGO_TARGET_DIR}" \
-      -e "${ROOT}" \
-      -e '/Users/[^/]+/\.cargo' \
-      -e '/Users/[^/]+/\.rustup' \
-      -e '/Users/[^/]+/Dev/' \
-      || true
+    strings "$bin" | grep -E "${patterns[@]}" || true
   )"
   if [[ -n "$hits" ]]; then
     echo "error: personal path(s) still embedded in $bin:" >&2

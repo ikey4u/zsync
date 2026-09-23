@@ -8,7 +8,7 @@ dist_dir = "dist"
 linux_glibc = "2.17"
 
 [env]
-# Isolated cargo home / target so release binaries do not embed $HOME paths.
+# Isolated cargo home / target; release verification allows system temp paths.
 CARGO_HOME_DIR = "/tmp/zsync-cargo"
 CARGO_TARGET_DIR = "/tmp/zsync-target"
 DIST_DIR = "{{vars.dist_dir}}"
@@ -19,6 +19,10 @@ description = "Format the whole project (nightly rustfmt: rustfmt.toml unstable 
 alias = ["fmt"]
 tools = { rust = "nightly" }
 run = "cargo fmt --all"
+
+[tasks.check]
+description = "Lint all Rust targets and features with Clippy"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
 
 [tasks.release]
 description = "Release-zip zsync (macOS / Linux / Windows) and zsyncd Linux x64 glibc 2.17"

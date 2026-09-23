@@ -123,8 +123,9 @@ pub fn parse_group_id(s: &str) -> Result<[u8; GROUP_ID_LEN]> {
         bail!("group_id must be {} hex chars", GROUP_ID_LEN * 2);
     }
     let mut id = [0u8; GROUP_ID_LEN];
-    for i in 0..GROUP_ID_LEN {
-        id[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    for (i, byte) in id.iter_mut().enumerate() {
+        let pair = s.get(i * 2..i * 2 + 2).expect("validated ASCII hex");
+        *byte = u8::from_str_radix(pair, 16)?;
     }
     Ok(id)
 }
@@ -145,8 +146,11 @@ pub fn sender_from_node_id(node_id: &str) -> Result<[u8; SENDER_LEN]> {
         bail!("node_id too short");
     }
     let mut id = [0u8; SENDER_LEN];
-    for i in 0..SENDER_LEN {
-        id[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    for (i, byte) in id.iter_mut().enumerate() {
+        let pair = s
+            .get(i * 2..i * 2 + 2)
+            .context("node_id must be ASCII hex")?;
+        *byte = u8::from_str_radix(pair, 16)?;
     }
     Ok(id)
 }
@@ -366,10 +370,14 @@ fn split_host_port(s: &str) -> Result<(String, u16)> {
         return Ok((host.to_string(), port));
     }
     match s.rfind(':') {
-        Some(i) if !s[..i].contains(':') => {
-            let host = s[..i].to_string();
-            let port: u16 = s[i + 1..].parse().context("invalid port")?;
-            Ok((host, port))
+        Some(i) if !s.split_at(i).0.contains(':') => {
+            let (host, port) = s.split_at(i);
+            let port: u16 = port
+                .strip_prefix(':')
+                .expect("split at colon")
+                .parse()
+                .context("invalid port")?;
+            Ok((host.to_string(), port))
         }
         _ => Ok((s.to_string(), DEFAULT_PORT)),
     }

@@ -193,8 +193,9 @@ pub fn load_pin(zsync_dir: &Path, hub: &str) -> Result<Option<[u8; 32]>> {
         bail!("corrupt pin for {hub}");
     }
     let mut pin = [0u8; 32];
-    for i in 0..32 {
-        pin[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)?;
+    for (i, byte) in pin.iter_mut().enumerate() {
+        let pair = hex.get(i * 2..i * 2 + 2).expect("validated ASCII hex");
+        *byte = u8::from_str_radix(pair, 16)?;
     }
     Ok(Some(pin))
 }
