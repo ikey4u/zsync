@@ -11,6 +11,8 @@ build = "build.rs"
 [workspace.lints.clippy]
 string_slice = "deny"
 
+# This crate inherits workspace lints; Cargo does not allow a local
+# [lints.clippy] table alongside workspace = true.
 [lints]
 workspace = true
 

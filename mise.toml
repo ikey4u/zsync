@@ -22,7 +22,7 @@ run = "cargo fmt --all"
 
 [tasks.check]
 description = "Lint all Rust targets and features with Clippy"
-run = "cargo clippy --all-targets --all-features -- -D warnings"
+run = "cargo clippy --all-targets --all-features -- -D warnings -D clippy::string_slice"
 
 [tasks.release]
 description = "Release-zip zsync (macOS / Linux / Windows) and zsyncd Linux x64 glibc 2.17"
